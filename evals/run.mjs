@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
-// Minimal markdown-driven pi eval runner. It clones a pinned repo, lets pi edit it from a prompt,
-// captures the transcript and diff, then asks a separate no-tools judge agent to score the result.
+// Minimal markdown-driven pi eval runner. It keeps one reusable checkout per fixture repo,
+// resets it to a pinned SHA for each run, lets pi edit it, then stores the transcript/diff under results.
 
 import {spawn} from 'node:child_process';
 import {createWriteStream, existsSync} from 'node:fs';
@@ -66,10 +66,7 @@ function unquote(value) {
   return value;
 }
 
-// Convert spec timeout fields to milliseconds; seconds fields are preferred for short evals.
-function durationMs(meta, secondsKey, minutesKey, defaultSeconds) {
-  return Number(meta[secondsKey] ?? Number(meta[minutesKey] ?? defaultSeconds / 60) * 60) * 1000;
-}
+const evalTimeoutMs = 2 * 60 * 1000;
 
 // Run a command, streaming stdout/stderr to files when requested, and reject on non-zero exit.
 function run(command, args, options = {}) {
@@ -125,18 +122,33 @@ function githubTokenForSpec(meta) {
   return token;
 }
 
-// Clone the target repo, check out the pinned SHA, and leave the repo ready for pi.
-async function prepareRepo(meta, resultDir) {
-  const repoDir = join(resultDir, 'repo');
+// Return a stable, readable local path for a fixture repo without leaking auth tokens into directory names.
+function checkoutDirForRepo(repo) {
+  const parsed = repo.match(/^(?:https:\/\/[^/]+\/|git@[^:]+:)?(.+?)(?:\.git)?$/);
+  const repoPath = parsed?.[1] ?? repo;
+  return resolve(root, 'evals/checkouts', slug(repoPath.replace(/^grant-/, '')));
+}
+
+// Create or update the reusable checkout, then reset it to the pinned SHA for this eval run.
+async function prepareRepo(meta) {
+  const repoDir = checkoutDirForRepo(meta.repo);
   const githubToken = githubTokenForSpec(meta);
   const cloneUrl = githubToken && /^https:\/\/github\.com\//.test(meta.repo)
     ? meta.repo.replace('https://github.com/', `https://x-access-token:${githubToken}@github.com/`)
     : meta.repo;
 
   // Disable credential helpers so macOS does not try to persist ephemeral eval tokens.
-  await run('git', ['-c', 'credential.helper=', 'clone', '--no-tags', cloneUrl, repoDir], {env: {GIT_CONFIG_GLOBAL: '/dev/null'}, echoStderr: true});
-  await run('git', ['remote', 'set-url', 'origin', meta.repo], {cwd: repoDir});
-  await run('git', ['checkout', meta.sha], {cwd: repoDir});
+  if (!existsSync(join(repoDir, '.git'))) {
+    await mkdir(dirname(repoDir), {recursive: true});
+    await run('git', ['-c', 'credential.helper=', 'clone', '--no-tags', cloneUrl, repoDir], {env: {GIT_CONFIG_GLOBAL: '/dev/null'}, echoStderr: true});
+    await run('git', ['remote', 'set-url', 'origin', meta.repo], {cwd: repoDir});
+  } else {
+    await run('git', ['-c', 'credential.helper=', 'fetch', '--no-tags', cloneUrl, '+refs/heads/*:refs/remotes/origin/*'], {cwd: repoDir, env: {GIT_CONFIG_GLOBAL: '/dev/null'}, echoStderr: true});
+  }
+
+  await run('git', ['checkout', '--detach', meta.sha], {cwd: repoDir});
+  await run('git', ['reset', '--hard', meta.sha], {cwd: repoDir});
+  await run('git', ['clean', '-ffdx'], {cwd: repoDir});
   return repoDir;
 }
 
@@ -155,7 +167,7 @@ async function runMainAgent(meta, repoDir, resultDir) {
   await run('pi', args, {
     cwd: repoDir,
     env: {npm_config_cache: join(resultDir, 'npm-cache')},
-    timeoutMs: durationMs(meta, 'timeoutSeconds', 'timeoutMinutes', 80),
+    timeoutMs: evalTimeoutMs,
     stdoutFile: join(resultDir, 'transcript.jsonl'),
     stderrFile: join(resultDir, 'pi.stderr.log'),
     echoStderr: true,
@@ -175,7 +187,7 @@ async function captureResult(meta, repoDir, resultDir) {
     try {
       const verification = await run('bash', ['-lc', meta.verify], {
         cwd: repoDir,
-        timeoutMs: durationMs(meta, 'verifyTimeoutSeconds', 'verifyTimeoutMinutes', 60),
+        timeoutMs: evalTimeoutMs,
         stdoutFile: join(resultDir, 'verify.stdout.log'),
         stderrFile: join(resultDir, 'verify.stderr.log'),
       });
@@ -186,48 +198,69 @@ async function captureResult(meta, repoDir, resultDir) {
   }
 }
 
-// Fill the markdown judge prompt template with eval artifacts.
-function renderJudgePrompt(template, values) {
-  return template.replaceAll(/{{([A-Z_]+)}}/g, (_, key) => values[key] ?? '');
+// Extract the coding agent's final natural-language response from the JSON event stream.
+async function saveAgentResponse(resultDir) {
+  const transcript = await readFile(join(resultDir, 'transcript.jsonl'), 'utf8');
+  const responses = [];
+
+  // Timeout can leave a partial JSONL line; ignore only that recoverable transcript artifact.
+  // Pi may emit assistant messages as individual message events or inside the final agent_end snapshot.
+  for (const line of transcript.split('\n').filter(Boolean)) {
+    let event;
+    try { event = JSON.parse(line); } catch { continue; }
+
+    const assistantMessages = [];
+    if (event.type === 'message' && event.message?.role === 'assistant') assistantMessages.push(event.message);
+    if (Array.isArray(event.messages)) assistantMessages.push(...event.messages.filter(message => message.role === 'assistant'));
+
+    for (const message of assistantMessages) {
+      for (const part of message.content ?? []) {
+        if (part.type !== 'text' || !part.text) continue;
+        responses.push({text: part.text, isFinal: String(part.textSignature ?? '').includes('final_answer')});
+      }
+    }
+  }
+
+  const finalResponse = [...responses].reverse().find(response => response.isFinal)?.text ?? responses.at(-1)?.text ?? '';
+  await writeFile(join(resultDir, 'agent-response.md'), finalResponse || '(no agent response captured)');
+  return finalResponse;
 }
 
-// Ask a separate no-tools pi invocation to judge the final patch against the markdown rubric.
-async function runJudge(specPath, spec, resultDir) {
-  const diff = await readFile(join(resultDir, 'diff.patch'), 'utf8');
+// Fill the markdown judge prompt template with eval artifacts.
+function renderJudgePrompt(template, values) {
+  return template.replaceAll(/{{\s*([A-Za-z0-9_]+)\s*}}/g, (_, key) => values[key] ?? '');
+}
+
+// Ask a separate pi invocation to inspect the edited checkout and judge the result.
+async function runJudge(specPath, spec, repoDir, resultDir) {
   const status = await readFile(join(resultDir, 'status.txt'), 'utf8');
-  const verify = existsSync(join(resultDir, 'verify.json')) ? await readFile(join(resultDir, 'verify.json'), 'utf8') : 'not run';
-  const mainError = existsSync(join(resultDir, 'main-agent-error.json')) ? await readFile(join(resultDir, 'main-agent-error.json'), 'utf8') : 'none';
+  const response = await readFile(join(resultDir, 'agent-response.md'), 'utf8');
+  const specMarkdown = await readFile(specPath, 'utf8');
   const template = await readFile(resolve(root, 'evals/judge.md'), 'utf8');
   const judgePrompt = renderJudgePrompt(template, {
-    SPEC_PATH: specPath,
-    PROMPT: spec.meta.prompt,
-    GUIDANCE: spec.guidance || '(none)',
-    MAIN_ERROR: mainError,
-    STATUS: status || '(clean)',
-    VERIFY: verify,
-    DIFF: diff || '(empty diff)',
+    spec: specMarkdown,
+    checkout: repoDir,
+    status: status || '(no changed files)',
+    response,
   });
 
-  const args = ['-p', '--no-tools', '--session-dir', join(resultDir, 'session'), ...mintExtensionArgs()];
+  const args = ['-p', '--session-dir', join(resultDir, 'session'), ...mintExtensionArgs()];
   const judgeModel = spec.meta.judgeModel || process.env.PI_EVAL_JUDGE_MODEL;
   if (judgeModel) args.push('--model', judgeModel);
 
   try {
-    const judged = await run('pi', args, {
+    await run('pi', args, {
+      cwd: repoDir,
       input: judgePrompt,
-      timeoutMs: durationMs(spec.meta, 'judgeTimeoutSeconds', 'judgeTimeoutMinutes', 25),
+      timeoutMs: evalTimeoutMs,
       stdoutFile: join(resultDir, 'judge.md'),
       stderrFile: join(resultDir, 'judge.stderr.log'),
       echoStdout: true,
       echoStderr: true,
     });
-
-    const score = judged.stdout.match(/^Score:\s*(\d+)/mi)?.[1];
-    await writeFile(join(resultDir, 'judge.json'), JSON.stringify({score: score ? Number(score) : null}, null, 2));
   } catch (error) {
-    const fallback = `Score: null\nVerdict: Judge failed: ${error.message}\nWhat went well:\n- See diff.patch.\nWhat went badly:\n- Judge did not complete.\nNotable slop:\n- Unknown.\nWould accept as a PR: no\n`;
+    const fallback = `What went well:\n- See changed files in status.txt.\nWhat went badly:\n- Judge did not complete: ${error.message}\nNotable slop:\n- Unknown.\n`;
     await writeFile(join(resultDir, 'judge.md'), fallback);
-    await writeFile(join(resultDir, 'judge.json'), JSON.stringify({score: null, error: error.message, timedOut: error.timedOut}, null, 2));
     console.error(error.message);
   }
 }
@@ -261,12 +294,12 @@ async function main() {
   await writeFile(join(resultDir, 'metadata.json'), JSON.stringify({name, repo: spec.meta.repo, sha: spec.meta.sha, startedAt: new Date().toISOString()}, null, 2));
 
   console.error(`Result dir: ${resultDir}`);
-  const repoDir = await prepareRepo(spec.meta, resultDir);
+  const repoDir = await prepareRepo(spec.meta);
 
   if (spec.meta.setup) {
     await run('bash', ['-lc', spec.meta.setup], {
       cwd: repoDir,
-      timeoutMs: durationMs(spec.meta, 'setupTimeoutSeconds', 'setupTimeoutMinutes', 60),
+      timeoutMs: evalTimeoutMs,
       stdoutFile: join(resultDir, 'setup.stdout.log'),
       stderrFile: join(resultDir, 'setup.stderr.log'),
       echoStderr: true,
@@ -282,7 +315,8 @@ async function main() {
   }
 
   await captureResult(spec.meta, repoDir, resultDir);
-  await runJudge(specPath, spec, resultDir);
+  await saveAgentResponse(resultDir);
+  await runJudge(specPath, spec, repoDir, resultDir);
   console.error(`\nDone. See ${resultDir}`);
 }
 

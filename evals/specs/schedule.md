@@ -2,7 +2,7 @@
 name: core-schedule-endpoint
 repo: https://github.com/grant-gh-test/core.git
 githubToken: GH_TEST
-sha: a8a35398d86cf418d9ed05820c5d93a2fc71a11a
+sha: b866878d124a2749f5391368a54429799be66df2
 prompt: |
   Add a POST /schedule endpoint to the existing server.
 
@@ -20,42 +20,16 @@ prompt: |
     ]
   }
 
-  Return JSON with the available meeting slots that fit within the date range, working hours, and existing busy intervals.
+  Return JSON with the available ranges that would fit the duration, are within the date range, working hours, and existing busy intervals.
   Don't add any dependencies.
-timeoutSeconds: 80
-judgeTimeoutSeconds: 25
+  Lets put the logic in a new schedule.ts file.
 ---
 
 # Evaluation guidance
+This is a net-new feature with complicated logic, so the main thing to evaluate is clarity of the mental model and types, along with the quality of the comments explaining the logic.
 
-An excellent result should add a compact scheduling implementation to the existing tiny server without replacing the project structure or adding framework scaffolding. The scheduling logic should be testable separately from HTTP handling, but this repo is intentionally small, so one helper module plus the existing server is enough.
-
-Good scheduling behavior:
-
-- `durationMinutes` must be a positive integer.
-- `workingHours.start` and `.end` are `HH:mm` UTC times, with start before end.
-- `range.start` and `.end` are valid ISO timestamps, with start before end.
-- busy intervals are valid ISO timestamp ranges, sorted/merged before slot generation.
-- overlapping and adjacent busy intervals are treated as one blocked interval.
-- generated slots stay inside the requested date range and daily working hours.
-- generated slots do not overlap busy time.
-- output is deterministic, sorted, and uses ISO strings.
-
-Good code shape:
-
-- no runtime dependencies
-- no Express/Fastify/Zod/etc.
-- no large generic calendar abstraction
-- scheduling logic is readable and has direct tests
-- HTTP handler returns JSON for success and errors
-- README gives an accurate example request and response
+I'd expect the agent not to add much/any input validation to align with our preference of avoiding overly defensive code, but I would want it to flag that it didn't in the response. If it did add validation, it should be a very small amount of code, like 3-5 lines. More than that is a sign of premature defensiveness.
 
 # Things to penalize
-
-- Using local timezone APIs in a way that changes behavior based on machine timezone.
-- Ignoring overlapping/adjacent busy intervals.
-- Producing slots outside working hours or outside the requested range.
-- Accepting malformed dates, negative durations, empty/invalid working hours, or invalid busy intervals.
-- Mixing all algorithmic logic into the route handler with no focused tests.
-- Replacing the existing server/project setup unnecessarily.
-- Adding runtime dependencies for validation or routing.
+- Adding any dependencies
+- overly verbose comments
