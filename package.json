@@ -1,0 +1,5 @@
+{
+  "scripts": {
+    "evals": "bun evals/run.mjs"
+  }
+}
