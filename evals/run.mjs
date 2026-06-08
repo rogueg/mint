@@ -66,7 +66,7 @@ function unquote(value) {
   return value;
 }
 
-const evalTimeoutMs = 2 * 60 * 1000;
+const evalTimeoutMs = 5 * 60 * 1000;
 
 // Run a command, streaming stdout/stderr to files when requested, and reject on non-zero exit.
 function run(command, args, options = {}) {
@@ -226,6 +226,132 @@ async function saveAgentResponse(resultDir) {
   return finalResponse;
 }
 
+// Write one markdown artifact per subagent call so eval debugging can see exactly what the child LLM saw and returned.
+async function saveSubagentInvocations(resultDir) {
+  const transcriptPath = join(resultDir, 'transcript.jsonl');
+  if (!existsSync(transcriptPath)) return;
+
+  const transcript = await readFile(transcriptPath, 'utf8');
+  const invocations = collectSubagentInvocations(transcript);
+  const counts = new Map();
+
+  for (const invocation of invocations) {
+    const session = await readSubagentSession(invocation.details?.sessionFile);
+    const promptName = invocation.arguments?.promptName || 'subagent';
+    const slugName = slug(promptName);
+    const n = (counts.get(slugName) ?? 0) + 1;
+    counts.set(slugName, n);
+
+    const metadata = {
+      promptName,
+      freshContext: invocation.details?.freshContext,
+      model: invocation.details?.model || session.model || '(unknown)',
+      thinking: session.thinking || '(unknown)',
+      sessionId: invocation.details?.sessionId || session.sessionId || '(unknown)',
+      sessionFile: invocation.details?.sessionFile || '(unknown)',
+      toolCallId: invocation.toolCallId,
+    };
+
+    const prompt = session.prompt || invocation.arguments?.prompt || '(prompt not captured)';
+    const response = session.response || stripSubagentSessionMarker(invocation.response) || '(response not captured)';
+    await writeFile(join(resultDir, `subagent-${slugName}-${n}.md`), renderSubagentInvocation(metadata, prompt, response));
+  }
+}
+
+// Pull subagent tool calls/results out of pi's JSON event stream, tolerating partial timeout transcripts.
+function collectSubagentInvocations(transcript) {
+  const calls = new Map();
+
+  for (const line of transcript.split('\n').filter(Boolean)) {
+    let event;
+    try { event = JSON.parse(line); } catch { continue; }
+
+    for (const message of messagesInEvent(event)) {
+      if (message.role === 'toolResult' && message.toolName === 'subagent') {
+        const call = calls.get(message.toolCallId) ?? {toolCallId: message.toolCallId};
+        call.response = getMessageText(message);
+        call.details = message.details ?? call.details;
+        calls.set(message.toolCallId, call);
+        continue;
+      }
+
+      for (const part of message.content ?? []) {
+        if (part.type !== 'toolCall' || part.name !== 'subagent') continue;
+        const call = calls.get(part.id) ?? {toolCallId: part.id};
+        if (!call.arguments || JSON.stringify(part.arguments ?? {}).length >= JSON.stringify(call.arguments ?? {}).length) {
+          call.arguments = part.arguments ?? {};
+        }
+        calls.set(part.id, call);
+      }
+    }
+  }
+
+  return [...calls.values()].filter(call => call.arguments || call.response || call.details);
+}
+
+// Return all complete message snapshots attached to a pi event.
+function messagesInEvent(event) {
+  const messages = [];
+  if (event.message) messages.push(event.message);
+  if (Array.isArray(event.messages)) messages.push(...event.messages);
+  if (event.assistantMessageEvent?.message) messages.push(event.assistantMessageEvent.message);
+  return messages;
+}
+
+// Read the child session to recover the expanded prompt, model settings, and final assistant text.
+async function readSubagentSession(sessionFile) {
+  const out = {sessionId: '', model: '', thinking: '', prompt: '', response: ''};
+  if (!sessionFile || !existsSync(sessionFile)) return out;
+
+  const text = await readFile(sessionFile, 'utf8');
+  const assistants = [];
+  for (const line of text.split('\n').filter(Boolean)) {
+    let event;
+    try { event = JSON.parse(line); } catch { continue; }
+
+    if (event.type === 'session') out.sessionId = event.id ?? out.sessionId;
+    if (event.type === 'model_change') out.model = event.modelId ? [event.provider, event.modelId].filter(Boolean).join('/') : out.model;
+    if (event.type === 'thinking_level_change') out.thinking = event.thinkingLevel ?? out.thinking;
+
+    const message = event.message;
+    if (!message) continue;
+    if (message.role === 'user') out.prompt = getMessageText(message) || out.prompt;
+    if (message.role === 'assistant') assistants.push(message);
+  }
+
+  out.response = getFinalAssistantText(assistants);
+  return out;
+}
+
+function getFinalAssistantText(messages) {
+  const texts = [];
+  for (const message of messages) {
+    for (const part of message.content ?? []) {
+      if (part.type !== 'text' || !part.text) continue;
+      texts.push({text: part.text, isFinal: String(part.textSignature ?? '').includes('final_answer')});
+    }
+  }
+  return [...texts].reverse().find(t => t.isFinal)?.text ?? texts.at(-1)?.text ?? '';
+}
+
+function getMessageText(message) {
+  return (message.content ?? []).filter(part => part.type === 'text' && part.text).map(part => part.text).join('\n');
+}
+
+function stripSubagentSessionMarker(text = '') {
+  return text.replace(/\n*\[subagent session: [^\]]+\]\s*$/, '').trim();
+}
+
+function renderSubagentInvocation(metadata, prompt, response) {
+  const metadataLines = Object.entries(metadata).map(([key, value]) => `- ${key}: ${value ?? '(unknown)'}`).join('\n');
+  return `# Subagent invocation\n\n## Metadata\n\n${metadataLines}\n\n## Prompt sent to subagent\n\n${fence(prompt)}\n\n## Final subagent response\n\n${fence(response)}\n`;
+}
+
+function fence(text) {
+  const ticks = text.includes('```') ? '````' : '```';
+  return `${ticks}\n${text}\n${ticks}`;
+}
+
 // Fill the markdown judge prompt template with eval artifacts.
 function renderJudgePrompt(template, values) {
   return template.replaceAll(/{{\s*([A-Za-z0-9_]+)\s*}}/g, (_, key) => values[key] ?? '');
@@ -316,6 +442,7 @@ async function main() {
 
   await captureResult(spec.meta, repoDir, resultDir);
   await saveAgentResponse(resultDir);
+  await saveSubagentInvocations(resultDir);
   await runJudge(specPath, spec, repoDir, resultDir);
   console.error(`\nDone. See ${resultDir}`);
 }
