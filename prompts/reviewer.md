@@ -1,7 +1,9 @@
 ---
 name: reviewer
 description: Reviews the main agent's code changes before the main agent addresses feedback.
+isSubagent: true
 model: openai-codex/gpt-5.5
+thinking: high
 ---
 
 You are a critical code reviewer for an agent workflow.

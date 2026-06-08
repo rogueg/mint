@@ -26,37 +26,30 @@ Some key things I'd look for:
 <sample-good-output>
 
 ## How rebase currently works
-- HUD sends rebaseLocal(repoPath, worktreePath, branchName, stack, continueExisting?).
-    - stack and continueExisting are booleans that select one of four paths: plain start, plain continue, stack start, stack continue.
-- Plain branch rebase:
-    - fetches origin
-    - force-updates local trunk to origin/main
-    - checks out the branch
-    - commits dirty files as a temporary WIP before wt2 rebase
-    - runs interactive autosquash rebase onto origin/main
-    - if successful, resets the WIP commit back into the worktree
-- Stack rebase:
-    - finds a gh-stack metadata file containing the requested branch
-    - mutates the parsed stack in memory by adding synthetic head fields
-    - validates only the trunk → first branch boundary
-    - blocks if stack branches are checked out elsewhere
-    - allows dirty files only if the current branch is the top stack branch
-    - fetches/fast-forwards trunk
-    - optionally commits dirty top-branch work as WIP
-    - loops bottom → top, rebasing each branch’s stored range (base..branch] onto the freshly rewritten parent
-    - updates gh-stack metadata after each branch so conflict resume has a usable cursor
-    - strips synthetic head before writing metadata
-- Stack continue:
-    - reads git’s rebase state to find the stopped branch
-    - finds the stack again
-    - continues the current git rebase
-    - updates metadata for that branch
-    - loops through remaining branches using similar logic to the initial stack path
 
-There are a lot of different code paths and conditionals here, and we could simplify a lot. A few questions:
-- do we care about being able to resume if a branch is stopped on a conflict mid-rebase?
-- do we need in interactive autosquash? It adds a lot of code
-- do we care about preventing rebasing if you're on a mid-stack commit with dirty files?
+The ui sends a request for `rebaseLocal(repoPath, worktreePath, branchName, stack, continueExisting)`
+- we only need the worktreePath. From there we can infer the repo, use the current branch, figure out if that branch is in a stack, and if it's currently stopped in a rebase.
+
+From there, it fans out to largely duplicative code dependong on plain/stack and continue/not.
+
+Plain branch rebase:
+- fetches origin and fast-forwards local `main`/trunk before rebasing.
+- rebases current branch onto `origin/<trunk>` with `--autosquash`.
+- temporarily commits dirty worktree changes, then mixed-resets the WIP commit afterward.
+- conflict does not throw; scan exposes `wt.rebase` and the UI shows “continue”.
+
+Stack rebase:
+- rebases the whole stack bottom-to-top, not just the clicked branch.
+- uses gh-stack stored `base` values as branch range boundaries, which preserves mid-stack amends/fixups correctly.
+- updates each child branch onto the newly rewritten parent.
+- writes gh-stack metadata after each successful branch so conflicts leave recoverable metadata.
+- preserves dirty worktree changes only when currently on the top branch.
+- blocks dirty mid-stack branches.
+- blocks rebasing if another worktree has one of the stack branches checked out.
+- fetches origin and force-fast-forwards local trunk so stale local `main` does not pollute bottom branch ranges.
+- handles already-landed bottom commits by skipping empty rebase steps.
+- removes wt2-only `head` before writing gh-stack metadata.
+ ab
 
 ## Simplification proposal
 Here's the shape I'd propose:
