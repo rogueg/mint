@@ -1,5 +1,5 @@
 ---
-name: rebase
+name: plan-rebase
 repo: https://github.com/rogueg/wt2
 githubToken: WT2
 sha: b6e4ee3
@@ -10,27 +10,22 @@ prompt: |
 This spec tests our ability to clean up some code that rebases stacks of git branches. The logic had become quite long and convoluted, and we want both a simple mental model, and fairly straightforward code.
 
 # Evaluation guidance
-The deslop prompt tells the agent to create an analysis of the existing code, and a plan to fix it. This output is what we're evaluating. We're not expecting it to make any changes.
+This is a plan eval: judge the response, not code changes. Use `good-communication` for the general standard, and compare against the example below.
 
-We want to evaluate a few things:
-* that the description of the current state of the code is accurate and concise.
-* that it correctly identifies and asks about things we could drop to simplify.
-* that the proposed plan is much simpler, and communicated clearly and concisely.
-
-Some key things I'd look for:
-* having 4 versions [plain, plain-continue, stack, stack-continue] adds a lot of overlapping logic. It'd be nice to have either a single flow for all cases, or one for plain, and one for stacks.
-* it writes pseudocode to concisely communicate the logic it's proposing
-* the logic is short and simple. It doesn't need to exactly what I have below as an example, there are few valid ways to solve this, the point is that the logic is pretty straightforward, linear, and self-contained.
-* It asks about things that we could consider dropping to simplify the logic.
+Specific things to look for:
+* accurately and concisely explains why the current rebase flow is hard to follow.
+* identifies the duplicated plain/plain-continue/stack/stack-continue paths as the main simplification opportunity.
+* proposes a short, linear target flow, ideally with pseudocode.
+* asks about behavior that could be dropped to simplify the implementation.
 
 <sample-good-output>
 
 ## How rebase currently works
 
-The ui sends a request for `rebaseLocal(repoPath, worktreePath, branchName, stack, continueExisting)`
-- we only need the worktreePath. From there we can infer the repo, use the current branch, figure out if that branch is in a stack, and if it's currently stopped in a rebase.
+The UI sends a request for `rebaseLocal(repoPath, worktreePath, branchName, stack, continueExisting)`.
+We only need the worktree path: from there we can infer the repo, current branch, whether the branch is in a stack, and whether it is currently stopped in a rebase.
 
-From there, it fans out to largely duplicative code dependong on plain/stack and continue/not.
+From there, the implementation fans out into duplicative code depending on plain/stack and continue/not.
 
 Plain branch rebase:
 - fetches origin and fast-forwards local `main`/trunk before rebasing.
@@ -49,7 +44,6 @@ Stack rebase:
 - fetches origin and force-fast-forwards local trunk so stale local `main` does not pollute bottom branch ranges.
 - handles already-landed bottom commits by skipping empty rebase steps.
 - removes wt2-only `head` before writing gh-stack metadata.
- ab
 
 ## Simplification proposal
 Here's the shape I'd propose:

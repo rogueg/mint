@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 // Minimal markdown-driven pi eval runner. It keeps one reusable checkout per fixture repo,
-// resets it to a pinned SHA for each run, lets pi edit it, then stores the transcript/diff under results.
+// resets it to either a pinned SHA or a GitHub PR head for each run, lets pi edit it,
+// then stores the transcript/diff under results.
 
 import {spawn} from 'node:child_process';
 import {createWriteStream, existsSync} from 'node:fs';
@@ -51,9 +52,11 @@ function parseSpec(markdown) {
     frontmatter[scalar[1]] = unquote(scalar[2].trim());
   }
 
-  for (const key of ['repo', 'sha', 'prompt']) {
-    if (!frontmatter[key]) throw new Error(`Missing required frontmatter field: ${key}`);
-  }
+  const prUrl = frontmatter.pr || frontmatter.prUrl;
+  if (prUrl && !frontmatter.pr) frontmatter.pr = prUrl;
+  if (!frontmatter.prompt && prUrl) frontmatter.prompt = `/summary ${prUrl}`;
+  if (!frontmatter.prompt) throw new Error('Missing required frontmatter field: prompt');
+  if (!prUrl && (!frontmatter.repo || !frontmatter.sha)) throw new Error('Spec must provide either pr/prUrl or both repo and sha');
 
   return {meta: frontmatter, guidance: match[2].trim()};
 }
@@ -129,25 +132,52 @@ function checkoutDirForRepo(repo) {
   return resolve(root, 'evals/checkouts', slug(repoPath.replace(/^grant-/, '')));
 }
 
-// Create or update the reusable checkout, then reset it to the pinned SHA for this eval run.
+// Parse GitHub PR URLs so specs can point at the review object instead of hand-pinning SHAs and diff ranges.
+function parseGithubPrUrl(url) {
+  const parsed = String(url).match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:[/?#].*)?$/);
+  if (!parsed) throw new Error(`Unsupported GitHub PR URL: ${url}`);
+  return {owner: parsed[1], repo: parsed[2], number: parsed[3], repoUrl: `https://github.com/${parsed[1]}/${parsed[2]}.git`};
+}
+
+// Resolve the repository URL and exact checkout target for either old SHA specs or newer PR URL specs.
+async function resolveCheckout(meta) {
+  const prUrl = meta.pr || meta.prUrl;
+  if (!prUrl) return {kind: 'sha', repo: meta.repo, sha: meta.sha};
+
+  const pr = parseGithubPrUrl(prUrl);
+  return {kind: 'pr', repo: pr.repoUrl, prUrl, prNumber: pr.number};
+}
+
+// Clone or update the reusable checkout. PR specs additionally fetch GitHub's pull refs so they still work after the contributor branch is deleted.
 async function prepareRepo(meta) {
-  const repoDir = checkoutDirForRepo(meta.repo);
+  const checkout = await resolveCheckout(meta);
+  const repoDir = checkoutDirForRepo(checkout.repo);
   const githubToken = githubTokenForSpec(meta);
-  const cloneUrl = githubToken && /^https:\/\/github\.com\//.test(meta.repo)
-    ? meta.repo.replace('https://github.com/', `https://x-access-token:${githubToken}@github.com/`)
-    : meta.repo;
+  const cloneUrl = githubToken && /^https:\/\/github\.com\//.test(checkout.repo)
+    ? checkout.repo.replace('https://github.com/', `https://x-access-token:${githubToken}@github.com/`)
+    : checkout.repo;
 
   // Disable credential helpers so macOS does not try to persist ephemeral eval tokens.
   if (!existsSync(join(repoDir, '.git'))) {
     await mkdir(dirname(repoDir), {recursive: true});
     await run('git', ['-c', 'credential.helper=', 'clone', '--no-tags', cloneUrl, repoDir], {env: {GIT_CONFIG_GLOBAL: '/dev/null'}, echoStderr: true});
-    await run('git', ['remote', 'set-url', 'origin', meta.repo], {cwd: repoDir});
+    await run('git', ['remote', 'set-url', 'origin', checkout.repo], {cwd: repoDir});
   } else {
     await run('git', ['-c', 'credential.helper=', 'fetch', '--no-tags', cloneUrl, '+refs/heads/*:refs/remotes/origin/*'], {cwd: repoDir, env: {GIT_CONFIG_GLOBAL: '/dev/null'}, echoStderr: true});
   }
 
-  await run('git', ['checkout', '--detach', meta.sha], {cwd: repoDir});
-  await run('git', ['reset', '--hard', meta.sha], {cwd: repoDir});
+  if (checkout.kind === 'pr') {
+    const prRef = `refs/remotes/origin/pull/${checkout.prNumber}/head`;
+    await run('git', ['reset', '--hard'], {cwd: repoDir});
+    await run('git', ['clean', '-ffdx'], {cwd: repoDir});
+    await run('git', ['-c', 'credential.helper=', 'fetch', '--no-tags', cloneUrl, `+refs/pull/${checkout.prNumber}/head:${prRef}`], {cwd: repoDir, env: {GIT_CONFIG_GLOBAL: '/dev/null'}, echoStderr: true});
+    await run('git', ['checkout', '-B', `eval-pr-${checkout.prNumber}`, prRef], {cwd: repoDir});
+    await run('git', ['reset', '--hard', prRef], {cwd: repoDir});
+  } else {
+    await run('git', ['checkout', '--detach', checkout.sha], {cwd: repoDir});
+    await run('git', ['reset', '--hard', checkout.sha], {cwd: repoDir});
+  }
+
   await run('git', ['clean', '-ffdx'], {cwd: repoDir});
   return repoDir;
 }
@@ -157,13 +187,18 @@ function mintExtensionArgs() {
   return ['--extension', resolve(root, 'extension.ts')];
 }
 
+// Replace simple {{frontmatterKey}} placeholders in prompts so specs can avoid duplicating PR URLs.
+function renderSpecPrompt(meta) {
+  return meta.prompt.replaceAll(/{{\s*([A-Za-z0-9_-]+)\s*}}/g, (_, key) => meta[key] ?? '');
+}
+
 // Invoke pi in JSON mode and store the event stream as the authoritative transcript.
 async function runMainAgent(meta, repoDir, resultDir) {
   const args = ['--mode', 'json', '--session-dir', join(resultDir, 'session'), ...mintExtensionArgs()];
   const model = meta.model || process.env.PI_EVAL_MODEL;
   if (model) args.push('--model', meta.thinking ? `${model}:${meta.thinking}` : model);
 
-  args.push(meta.prompt);
+  args.push(renderSpecPrompt(meta));
   await run('pi', args, {
     cwd: repoDir,
     env: {npm_config_cache: join(resultDir, 'npm-cache')},
@@ -357,12 +392,20 @@ function renderJudgePrompt(template, values) {
   return template.replaceAll(/{{\s*([A-Za-z0-9_]+)\s*}}/g, (_, key) => values[key] ?? '');
 }
 
+// Pick the judge prompt from the spec prefix: build- judges code, summary-/plan- judge responses.
+function judgeTemplateForSpec(specPath, spec) {
+  const specName = spec.meta.name || basename(specPath, '.md');
+  const prefix = specName.split('-')[0];
+  if (['build', 'summary', 'plan'].includes(prefix)) return resolve(root, 'evals/judges', `${prefix}.md`);
+  return resolve(root, 'evals/judge.md');
+}
+
 // Ask a separate pi invocation to inspect the edited checkout and judge the result.
 async function runJudge(specPath, spec, repoDir, resultDir) {
   const status = await readFile(join(resultDir, 'status.txt'), 'utf8');
   const response = await readFile(join(resultDir, 'agent-response.md'), 'utf8');
   const specMarkdown = await readFile(specPath, 'utf8');
-  const template = await readFile(resolve(root, 'evals/judge.md'), 'utf8');
+  const template = await readFile(judgeTemplateForSpec(specPath, spec), 'utf8');
   const judgePrompt = renderJudgePrompt(template, {
     spec: specMarkdown,
     checkout: repoDir,
@@ -395,7 +438,7 @@ function slug(input) {
   return input.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 80) || 'eval';
 }
 
-// Resolve `schedule` to `evals/specs/schedule.md`, while still allowing explicit paths.
+// Resolve `build-schedule` to `evals/specs/build-schedule.md`, while still allowing explicit paths.
 function resolveSpecPath(specArg) {
   if (specArg.includes('/') || specArg.endsWith('.md')) return resolve(specArg);
   return resolve(root, 'evals/specs', `${specArg}.md`);
@@ -407,7 +450,7 @@ async function main() {
   const [specArg] = process.argv.slice(2);
   if (!specArg) {
     console.error('Usage: bun evals/run.mjs <spec-name>');
-    console.error('Example: bun evals/run.mjs schedule');
+    console.error('Example: bun evals/run.mjs build-schedule');
     process.exit(1);
   }
 
@@ -417,7 +460,7 @@ async function main() {
   const resultDir = resolve(root, 'evals/results', `${new Date().toISOString().replace(/[:.]/g, '-')}_${slug(name)}`);
   await mkdir(resultDir, {recursive: true});
   await cp(specPath, join(resultDir, 'spec.md'));
-  await writeFile(join(resultDir, 'metadata.json'), JSON.stringify({name, repo: spec.meta.repo, sha: spec.meta.sha, startedAt: new Date().toISOString()}, null, 2));
+  await writeFile(join(resultDir, 'metadata.json'), JSON.stringify({name, repo: spec.meta.repo, sha: spec.meta.sha, pr: spec.meta.pr || spec.meta.prUrl, startedAt: new Date().toISOString()}, null, 2));
 
   console.error(`Result dir: ${resultDir}`);
   const repoDir = await prepareRepo(spec.meta);

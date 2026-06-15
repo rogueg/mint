@@ -1,35 +1,20 @@
 ---
 name: summary-csv-export
-repo: https://github.com/graphene-data/graphene
-# squash-merge commit of https://github.com/graphene-data/graphene/pull/462
-sha: 5f48a0f0656cf39f4b9a9ea9ab3e47eddae6e7e9
+pr: https://github.com/graphene-data/graphene/pull/462
 prompt: |
-  /change-summary HEAD^..HEAD
+  /summary {{pr}}
 ---
 
-This spec tests our ability to summarize a medium-sized feature PR (CSV export, ~420 additions across cli, lang, and ui). The change has two user-facing surfaces (CLI flag and UI download button), one shared core (`rowsToCsv`), some non-obvious plumbing (chart data registry + run socket), and a side refactor — a good test of whether the summary organizes by concept instead of by file.
+This spec tests our ability to summarize a medium-sized feature PR (CSV export, ~420 additions across cli, lang, and ui). The change has two user-facing surfaces (CLI flag and UI download button), one shared core (`rowsToCsv`), some non-obvious plumbing (chart data registry + run socket), and a side refactor. A good summary organizes around those parts, not around the files in the diff.
 
 # Evaluation guidance
-We're evaluating the written summary only. The agent should not make any changes.
+This is a summary eval: judge the response, not code changes. Use `good-communication` for the general standard, and compare against the example below.
 
-The audience is an expert teammate who hasn't seen this change and wants to understand it without reading the diff. Evaluate:
-* **accuracy** — every claim should be checkable against the diff. Penalize invented motivations or wrong mechanics.
-* **altitude** — leads with what changed and why, then explains the mechanism conceptually, naming the key files/functions. A file-by-file walkthrough of the diff is a failure even if accurate.
-* **selectivity** — the important things are covered (below), minor test-infra churn is at most a brief aside.
-* **concision** — small snippets only where they earn their keep; no laundry lists.
-
-Key things a good summary covers:
-* both surfaces: `--format csv` on `graphene run` (works for raw GSQL, `-q` named queries, and `-c` charts) and the hover download button on charts in the UI.
-* the shared serializer `rowsToCsv` in the new `lang/csv.ts`, and why it lives in `lang/` (used by both cli and ui).
-* the subtle one: chart export returns the *raw* query rows, not the enriched chart data — which is why `ECharts.svelte` now `structuredClone`s data before `enrich()`, and why exports are registered in `window.$GRAPHENE.chartExports`.
-* in csv mode, status logging moves to stderr so stdout is clean, pipeable CSV.
-* the guardrails: `--format` is validated, and csv on a markdown file requires `-q` or `-c`.
-* notices the side refactor: run/list/named-query in `run.ts` shared duplicated workspace-analysis code, now extracted into `analyzeMdFile()`.
-
-Things to penalize:
-* claiming csv export works on a whole markdown page without `-q`/`-c`.
-* presenting the screenshot-test accommodations (hiding the button, parking the mouse) as a headline item.
-* summarizing test files as if they were the feature.
+Specific things to look for:
+* separates the CLI surface, UI surface, shared CSV plumbing, and side refactor.
+* covers the important mechanics: `--format csv`, stderr status logging, md-file guardrail, `rowsToCsv`, `window.$GRAPHENE.chartExports`, and raw rows vs enriched chart data.
+* does not claim csv export works for a whole markdown page without `-q`/`-c`.
+* does not treat screenshot-test accommodations or test files as the feature.
 
 <sample-good-output>
 

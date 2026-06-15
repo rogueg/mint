@@ -1,5 +1,5 @@
 ---
-name: core-schedule-endpoint
+name: build-schedule
 repo: https://github.com/grant-gh-test/core.git
 githubToken: GH_TEST
 sha: b866878d124a2749f5391368a54429799be66df2
@@ -26,10 +26,11 @@ prompt: |
 ---
 
 # Evaluation guidance
-This is a net-new feature with complicated logic, so the main thing to evaluate is clarity of the mental model and types, along with the quality of the comments explaining the logic.
+This is a build eval: judge the resulting code first. Use `good-code` for the general standard.
 
-I'd expect the agent not to add much/any input validation to align with our preference of avoiding overly defensive code, but I would want it to flag that it didn't in the response. If it did add validation, it should be a very small amount of code, like 3-5 lines. More than that is a sign of premature defensiveness.
-
-# Things to penalize
-- Adding any dependencies
-- overly verbose comments
+Specific things to look for:
+* scheduling logic has a clear mental model: range -> working-hour windows -> subtract busy intervals -> keep slots that fit the duration.
+* types and comments make the time/range logic easy to follow.
+* no new dependencies.
+* little or no input validation; if validation exists, it should be small and not dominate the feature.
+* final response explains the implementation and notes any validation assumptions.
