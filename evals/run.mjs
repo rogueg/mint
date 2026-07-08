@@ -176,6 +176,16 @@ async function prepareRepo(meta) {
   } else {
     await run('git', ['checkout', '--detach', checkout.sha], {cwd: repoDir});
     await run('git', ['reset', '--hard', checkout.sha], {cwd: repoDir});
+
+    // SHA specs often point at old commits where the real fix now exists on main. Keep the
+    // shared checkout, but hide fetched branches/tags before the agent runs so it cannot
+    // inspect future refs like origin/main for the answer.
+    await run('git', ['remote', 'remove', 'origin'], {cwd: repoDir}).catch(() => {});
+    const refs = await run('git', ['for-each-ref', '--format=%(refname)', 'refs/remotes', 'refs/heads', 'refs/tags'], {cwd: repoDir});
+    for (const ref of refs.stdout.split('\n').filter(Boolean)) {
+      await run('git', ['update-ref', '-d', ref], {cwd: repoDir});
+    }
+    await run('git', ['reflog', 'expire', '--expire=now', '--all'], {cwd: repoDir});
   }
 
   await run('git', ['clean', '-ffdx'], {cwd: repoDir});
@@ -209,8 +219,10 @@ async function runMainAgent(meta, repoDir, resultDir) {
   });
 }
 
-// Capture the patch and optional verification output after the agent finishes.
+// Capture the patch, any markdown scratch artifacts, and optional verification output after the agent finishes.
 async function captureResult(meta, repoDir, resultDir) {
+  await saveMarkdownArtifacts(repoDir, resultDir);
+
   // Intent-to-add makes untracked files appear in `git diff` without actually staging content.
   await run('git', ['add', '--intent-to-add', '--', '.', ':!node_modules', ':!dist', ':!coverage'], {cwd: repoDir});
   const status = await run('git', ['status', '--short'], {cwd: repoDir});
@@ -230,6 +242,19 @@ async function captureResult(meta, repoDir, resultDir) {
     } catch (error) {
       await writeFile(join(resultDir, 'verify.json'), JSON.stringify({ok: false, code: error.code, timedOut: error.timedOut}, null, 2));
     }
+  }
+}
+
+// Copy untracked markdown files into result artifacts before intent-to-add changes their git status.
+async function saveMarkdownArtifacts(repoDir, resultDir) {
+  const files = await run('git', ['ls-files', '--others', '--exclude-standard', '--', '*.md', ':(exclude)node_modules/**', ':(exclude)dist/**', ':(exclude)coverage/**'], {cwd: repoDir});
+  const artifactFiles = files.stdout.split('\n').filter(Boolean);
+  if (!artifactFiles.length) return;
+
+  for (const file of artifactFiles) {
+    const destination = join(resultDir, 'artifacts', file);
+    await mkdir(dirname(destination), {recursive: true});
+    await cp(join(repoDir, file), destination);
   }
 }
 
